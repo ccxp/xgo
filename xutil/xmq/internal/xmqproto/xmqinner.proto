@@ -1,0 +1,12 @@
+
+syntax = "proto3";
+package xmqproto;
+
+
+// 记录处理状态
+message QueueItemLog {
+    uint64 Uuid1 = 1;
+    uint64 Uuid2 = 3;
+    int64 UpdateTime = 2; // nanoseconds，上次处理更新结果时间，自动设置
+}
+

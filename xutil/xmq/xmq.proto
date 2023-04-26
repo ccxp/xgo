@@ -1,0 +1,21 @@
+
+syntax = "proto3";
+package xmq;
+
+message QueueItem {
+    // 用户设置Data1-5
+    bytes Data1 = 1;
+    bytes Data2 = 2;
+    bytes Data3 = 3;
+    bytes Data4 = 4;
+    bytes Data5 = 5;
+
+    // 以下是系统设置
+    int64 Timestamp = 6; // nanoseconds，添加时间
+    uint64 Uuid1 = 7; // 每次放回队列都会重新生成
+    uint64 Uuid2 = 10; // 每次放回队列都会重新生成
+
+    int64 UpdateTime = 8; // nanoseconds，上次处理更新结果时间，自动设置
+	uint32 HandlerCount = 9; // 已处理次数，自动设置
+}
+
