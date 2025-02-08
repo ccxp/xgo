@@ -2,15 +2,16 @@ package xsender_test
 
 import (
 	"fmt"
-	"github.com/ccxp/xgo/xhttp"
-	"github.com/ccxp/xgo/xlog"
-	"github.com/ccxp/xgo/xutil/xfile"
-	"github.com/ccxp/xgo/xutil/xsender"
 	"log"
 	"net/http"
 	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/ccxp/xgo/xhttp"
+	"github.com/ccxp/xgo/xlog"
+	"github.com/ccxp/xgo/xutil/xfile"
+	"github.com/ccxp/xgo/xutil/xsender"
 )
 
 var recvCount uint32
@@ -30,14 +31,14 @@ func ExampleDataSender() {
 
 	ds := &xsender.DataSender{
 		GetAddrs: func(sect int) []string {
-			return []string{"127.0.0.1:11111"}
+			return []string{"127.0.0.1:11113"}
 		},
 		IsAddrOK: func(addr string) (bool, bool) {
 			return true, true
 		},
 
 		NewRequest: func(sect int, addr string) (*http.Request, error) {
-			return http.NewRequest("GET", "http://127.0.0.1:11111/", nil)
+			return http.NewRequest("GET", "http://127.0.0.1:11113/", nil)
 		},
 		RoundTripper: func(sect int, addr string, req *http.Request) (*http.Response, error) {
 			return transport.RoundTrip(req)

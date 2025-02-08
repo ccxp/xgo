@@ -463,18 +463,18 @@ func (es *rwcEofSignal) StartTimer() {
 //
 // Base on net.http.Transport, but support other protocol.
 type Transport struct {
-	idleMu     sync.Mutex
-	wantIdle   bool                                // user has requested to close all idle conns
-	idleConn   map[connectMethodKey][]*persistConn // most recently used at end
-	idleConnCh map[connectMethodKey]chan *persistConn
-	idleLRU    connLRU
+	idleMu       sync.Mutex
+	closeIdle    bool                                // user has requested to close all idle conns
+	idleConn     map[connectMethodKey][]*persistConn // most recently used at end
+	idleConnWait map[connectMethodKey]wantConnQueue  // waiting getConns
+	idleLRU      connLRU
 
 	reqMu       sync.Mutex
 	reqCanceler map[Request]func(error)
 
-	connCountMu          sync.Mutex
-	connPerHostCount     map[connectMethodKey]int
-	connPerHostAvailable map[connectMethodKey]chan struct{}
+	connsPerHostMu   sync.Mutex
+	connsPerHost     map[connectMethodKey]int
+	connsPerHostWait map[connectMethodKey]wantConnQueue // waiting getConns
 
 	Balancer *Balancer
 	Tracer   *Tracer
@@ -556,6 +556,30 @@ type Transport struct {
 	// ProxyConnectHeader optionally specifies headers to send to
 	// proxies during CONNECT requests.
 	ProxyConnectHeader http.Header
+
+	// WriteBufferSize specifies the size of the write buffer used
+	// when writing to the transport.
+	// If zero, a default (currently 4KB) is used.
+	WriteBufferSize int
+
+	// ReadBufferSize specifies the size of the read buffer used
+	// when reading from the transport.
+	// If zero, a default (currently 4KB) is used.
+	ReadBufferSize int
+}
+
+func (t *Transport) writeBufferSize() int {
+	if t.WriteBufferSize > 0 {
+		return t.WriteBufferSize
+	}
+	return 4 << 10
+}
+
+func (t *Transport) readBufferSize() int {
+	if t.ReadBufferSize > 0 {
+		return t.ReadBufferSize
+	}
+	return 4 << 10
 }
 
 // RoundTrip execute a RPC transaction.
@@ -681,8 +705,7 @@ func (t *Transport) CloseIdleConnections() {
 	t.idleMu.Lock()
 	m := t.idleConn
 	t.idleConn = nil
-	t.idleConnCh = nil
-	t.wantIdle = true
+	t.closeIdle = true
 	t.idleLRU = connLRU{}
 	t.idleMu.Unlock()
 	for _, conns := range m {
@@ -742,23 +765,29 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 	t.idleMu.Lock()
 	defer t.idleMu.Unlock()
 
-	waitingDialer := t.idleConnCh[key]
-	select {
-	case waitingDialer <- pconn:
-		// We're done with this pconn and somebody else is
-		// currently waiting for a conn of this type (they're
-		// actively dialing, but this conn is ready
-		// first). Chrome calls this socket late binding. See
-		// https://insouciant.org/tech/connection-management-in-chromium/
-		return nil
-	default:
-		if waitingDialer != nil {
-			// They had populated this, but their dial won
-			// first, so we can clean up this map entry.
-			delete(t.idleConnCh, key)
+	if q, ok := t.idleConnWait[key]; ok {
+		done := false
+
+		// Loop over the waiting list until we find a w that isn't done already, and hand it pconn.
+		for q.len() > 0 {
+			w := q.popFront()
+			if w.tryDeliver(pconn, nil) {
+				done = true
+				break
+			}
+		}
+
+		if q.len() == 0 {
+			delete(t.idleConnWait, key)
+		} else {
+			t.idleConnWait[key] = q
+		}
+		if done {
+			return nil
 		}
 	}
-	if t.wantIdle {
+
+	if t.closeIdle {
 		return errWantIdle
 	}
 	if t.idleConn == nil {
@@ -766,6 +795,7 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 	}
 	idles := t.idleConn[key]
 	if len(idles) >= t.maxIdleConnsPerHost() {
+		// xlog.Warnf("too many idle host %v", key.Addr)
 		return errTooManyIdleHost
 	}
 	for _, exist := range idles {
@@ -791,56 +821,87 @@ func (t *Transport) tryPutIdleConn(pconn *persistConn) error {
 	return nil
 }
 
-// getIdleConnCh returns a channel to receive and return idle
-// persistent connection for the given connectMethod.
-// It may return nil, if persistent connections are not being used.
-func (t *Transport) getIdleConnCh(key connectMethodKey) chan *persistConn {
+// queueForIdleConn queues w to receive the next idle connection for w.cm.
+// As an optimization hint to the caller, queueForIdleConn reports whether
+// it successfully delivered an already-idle connection.
+func (t *Transport) queueForIdleConn(w *wantConn) (delivered bool) {
 	if t.DisableKeepAlives {
-		return nil
+		return false
 	}
-	t.idleMu.Lock()
-	defer t.idleMu.Unlock()
-	t.wantIdle = false
-	if t.idleConnCh == nil {
-		t.idleConnCh = make(map[connectMethodKey]chan *persistConn)
-	}
-	ch, ok := t.idleConnCh[key]
-	if !ok {
-		ch = make(chan *persistConn)
-		t.idleConnCh[key] = ch
-	}
-	return ch
-}
 
-func (t *Transport) getIdleConn(key connectMethodKey) (pconn *persistConn, idleSince time.Time) {
 	t.idleMu.Lock()
 	defer t.idleMu.Unlock()
 
-	for {
-		pconns, ok := t.idleConn[key]
-		if !ok {
-			return nil, time.Time{}
+	// Stop closing connections that become idle - we might want one.
+	// (That is, undo the effect of t.CloseIdleConnections.)
+	t.closeIdle = false
+
+	if w == nil {
+		// Happens in test hook.
+		return false
+	}
+
+	// If IdleConnTimeout is set, calculate the oldest
+	// persistConn.idleAt time we're willing to use a cached idle
+	// conn.
+	var oldTime time.Time
+	if t.IdleConnTimeout > 0 {
+		oldTime = time.Now().Add(-t.IdleConnTimeout)
+	}
+
+	// Look for most recently-used idle connection.
+	if list, ok := t.idleConn[w.key]; ok {
+		stop := false
+		delivered := false
+		for len(list) > 0 && !stop {
+			pconn := list[len(list)-1]
+
+			// See whether this connection has been idle too long, considering
+			// only the wall time (the Round(0)), in case this is a laptop or VM
+			// coming out of suspend with previously cached idle connections.
+			tooOld := !oldTime.IsZero() && pconn.idleAt.Round(0).Before(oldTime)
+			if tooOld {
+				// Async cleanup. Launch in its own goroutine (as if a
+				// time.AfterFunc called it); it acquires idleMu, which we're
+				// holding, and does a synchronous net.Conn.Close.
+				go pconn.closeConnIfStillIdle()
+			}
+			if pconn.isBroken() || tooOld {
+				// If either persistConn.readLoop has marked the connection
+				// broken, but Transport.removeIdleConn has not yet removed it
+				// from the idle list, or if this persistConn is too old (it was
+				// idle too long), then ignore it and look for another. In both
+				// cases it's already in the process of being closed.
+				list = list[:len(list)-1]
+				continue
+			}
+			delivered = w.tryDeliver(pconn, nil)
+			if delivered {
+				// Remove it from the list.
+				t.idleLRU.remove(pconn)
+				list = list[:len(list)-1]
+			}
+			stop = true
 		}
-		if len(pconns) == 1 {
-			pconn = pconns[0]
-			delete(t.idleConn, key)
+		if len(list) > 0 {
+			t.idleConn[w.key] = list
 		} else {
-			// 2 or more cached connections; use the most
-			// recently used one at the end.
-			pconn = pconns[len(pconns)-1]
-			t.idleConn[key] = pconns[:len(pconns)-1]
+			delete(t.idleConn, w.key)
 		}
-		t.idleLRU.remove(pconn)
-		if pconn.isBroken() {
-			// There is a tiny window where this is
-			// possible, between the connecting dying and
-			// the persistConn readLoop calling
-			// Transport.removeIdleConn. Just skip it and
-			// carry on.
-			continue
+		if stop {
+			return delivered
 		}
-		return pconn, pconn.idleAt
 	}
+
+	// Register to receive next connection that becomes idle.
+	if t.idleConnWait == nil {
+		t.idleConnWait = make(map[connectMethodKey]wantConnQueue)
+	}
+	q := t.idleConnWait[w.key]
+	q.cleanFront()
+	q.pushBack(w)
+	t.idleConnWait[w.key] = q
+	return false
 }
 
 // removeIdleConn marks pconn as dead.
@@ -914,6 +975,7 @@ func (t *Transport) replaceReqCanceler(r Request, fn func(error)) bool {
 var zeroDialer net.Dialer
 
 func (t *Transport) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	// xlog.Warnf("dial %v %v", network, addr)
 	if t.DialContext != nil {
 		return t.DialContext(ctx, network, addr)
 	}
@@ -928,11 +990,18 @@ func (t *Transport) dial(ctx context.Context, network, addr string) (net.Conn, e
 // specified in the connectMethod. This includes doing a proxy CONNECT
 // and/or setting up TLS.  If this doesn't return an error, the persistConn
 // is ready to write requests to.
-func (t *Transport) getConn(treq *transportRequest, cm *connectMethod, respInfo *TraceResultInfo) (*persistConn, error) {
+func (t *Transport) getConn(treq *transportRequest, cm *connectMethod, respInfo *TraceResultInfo) (pc *persistConn, err error) {
+
 	req := treq.req
 	ctx := req.Context()
 	if ctx == nil {
 		ctx = context.Background()
+	}
+
+	var ctxcancel context.CancelFunc
+	if t.MaxConnsPerHost > 0 && t.DialTimeout > 0 {
+		// MaxConnsPerHost > 0 的情况下有等待dial的可能，会超出 DialTimeout 的时间，所以要用ctx来做timeout
+		ctx, ctxcancel = context.WithTimeout(ctx, t.DialTimeout)
 	}
 
 	ts := time.Now()
@@ -941,7 +1010,22 @@ func (t *Transport) getConn(treq *transportRequest, cm *connectMethod, respInfo 
 	}
 	connInfo := *cm.connInfo
 	connKey := *cm.connKey
+
+	w := &wantConn{
+		cm:    cm,
+		key:   connKey,
+		ctx:   ctx,
+		ready: make(chan struct{}, 1),
+	}
 	defer func() {
+		if err != nil {
+			w.cancel(t, err)
+		}
+
+		if ctxcancel != nil {
+			ctxcancel()
+		}
+
 		gotConnInfo.Duration = time.Since(ts)
 		if t.Balancer.StatConn != nil {
 			t.Balancer.StatConn(treq.req, &connInfo, gotConnInfo)
@@ -951,8 +1035,11 @@ func (t *Transport) getConn(treq *transportRequest, cm *connectMethod, respInfo 
 		}
 	}()
 
-	if pc, idleSince := t.getIdleConn(connKey); pc != nil {
-		pc.gotIdleConnTrace(idleSince, gotConnInfo)
+	// Queue for idle connection.
+	if delivered := t.queueForIdleConn(w); delivered {
+		pc := w.pc
+
+		pc.gotIdleConnTrace(pc.idleAt, gotConnInfo)
 
 		// set request canceler to some non-nil function so we
 		// can detect whether it was cleared between now and when
@@ -961,92 +1048,64 @@ func (t *Transport) getConn(treq *transportRequest, cm *connectMethod, respInfo 
 		return pc, nil
 	}
 
-	type dialRes struct {
-		pc  *persistConn
-		err error
-	}
-	dialc := make(chan dialRes)
-
-	handlePendingDial := func() {
-		go func() {
-			if v := <-dialc; v.err == nil {
-				t.putOrCloseIdleConn(v.pc)
-			} else {
-				t.decHostConnCount(connKey)
-			}
-		}()
-	}
-
 	cancelc := make(chan error, 1)
 	t.setReqCanceler(req, func(err error) { cancelc <- err })
 
-	if t.MaxConnsPerHost > 0 {
-		select {
-		case <-t.incHostConnCount(connKey):
-			// count below conn per host limit; proceed
-		case pc := <-t.getIdleConnCh(connKey):
-			gotConnInfo.Conn = pc.conn
-			gotConnInfo.Reused = pc.isReused()
-			return pc, nil
-		case <-ctx.Done():
-			gotConnInfo.Err = ctx.Err()
-			return nil, gotConnInfo.Err
-		case err := <-cancelc:
-			if err == ErrRequestCanceled {
-				err = ErrRequestCanceledConn
-			}
-			gotConnInfo.Err = err
-			return nil, err
-		}
-	}
+	// Queue for permission to dial.
+	t.queueForDial(w)
 
-	go func() {
-		pc, err := t.dialConn(ctx, cm)
-		dialc <- dialRes{pc, err}
-	}()
-
-	idleConnCh := t.getIdleConnCh(connKey)
+	// Wait for completion or cancellation.
 	select {
-	case v := <-dialc:
-		// Our dial finished.
-		if v.pc != nil {
-			gotConnInfo.Conn = v.pc.conn
-			return v.pc, nil
-		}
-		// Our dial failed. See why to return a nicer error
-		// value.
-		t.decHostConnCount(connKey)
-		select {
-		case <-ctx.Done():
-			gotConnInfo.Err = ctx.Err()
-			return nil, gotConnInfo.Err
-		case err := <-cancelc:
-			if err == ErrRequestCanceled {
-				err = ErrRequestCanceledConn
+	case <-w.ready:
+
+		if w.err != nil {
+			// If the request has been canceled, that's probably
+			// what caused w.err; if so, prefer to return the
+			// cancellation error (see golang.org/issue/16049).
+			select {
+			case <-ctx.Done():
+
+				err = ctx.Err()
+				if err == context.DeadlineExceeded && ctxcancel != nil {
+					err = &TransportConnError{
+						Err:     fmt.Errorf("dial %v %v: %v", connKey.Network, connKey.Addr, err),
+						timeout: true,
+					}
+				} else {
+					err = newTransportConnError(err)
+				}
+				gotConnInfo.Err = err
+				return nil, err
+			case err := <-cancelc:
+				if err == ErrRequestCanceled {
+					err = ErrRequestCanceledConn
+				}
+				gotConnInfo.Err = err
+				return nil, err
+			default:
+				// return below
+				err := newTransportConnError(w.err)
+				gotConnInfo.Err = err
+				return nil, err
 			}
-			gotConnInfo.Err = err
-			return nil, err
-		default:
-			err := newTransportConnError(v.err)
-			gotConnInfo.Err = err
-			return nil, err
 		}
-	case pc := <-idleConnCh:
-		// Another request finished first and its net.Conn
-		// became available before our dial. Or somebody
-		// else's dial that they didn't use.
-		// But our dial is still going, so give it away
-		// when it finishes:
-		handlePendingDial()
-		gotConnInfo.Conn = pc.conn
-		gotConnInfo.Reused = pc.isReused()
-		return pc, nil
+		gotConnInfo.Conn = w.pc.conn
+		gotConnInfo.Reused = w.pc.isReused()
+
+		return w.pc, w.err
 	case <-ctx.Done():
-		handlePendingDial()
-		gotConnInfo.Err = ctx.Err()
-		return nil, gotConnInfo.Err
+
+		err = ctx.Err()
+		if err == context.DeadlineExceeded && ctxcancel != nil {
+			err = &TransportConnError{
+				Err:     fmt.Errorf("dial %v %v: %v", connKey.Network, connKey.Addr, err),
+				timeout: true,
+			}
+		}
+		gotConnInfo.Err = err
+
+		return nil, err
 	case err := <-cancelc:
-		handlePendingDial()
 		if err == ErrRequestCanceled {
 			err = ErrRequestCanceledConn
 		}
@@ -1055,81 +1114,105 @@ func (t *Transport) getConn(treq *transportRequest, cm *connectMethod, respInfo 
 	}
 }
 
-// incHostConnCount increments the count of connections for a
-// given host. It returns an already-closed channel if the count
-// is not at its limit; otherwise it returns a channel which is
-// notified when the count is below the limit.
-func (t *Transport) incHostConnCount(cmKey connectMethodKey) <-chan struct{} {
+// queueForDial queues w to wait for permission to begin dialing.
+// Once w receives permission to dial, it will do so in a separate goroutine.
+func (t *Transport) queueForDial(w *wantConn) {
+
 	if t.MaxConnsPerHost <= 0 {
-		return connsPerHostClosedCh
+		go t.dialConnFor(w)
+		return
 	}
-	t.connCountMu.Lock()
-	defer t.connCountMu.Unlock()
-	if t.connPerHostCount[cmKey] == t.MaxConnsPerHost {
-		if t.connPerHostAvailable == nil {
-			t.connPerHostAvailable = make(map[connectMethodKey]chan struct{})
+
+	t.connsPerHostMu.Lock()
+	defer t.connsPerHostMu.Unlock()
+
+	if n := t.connsPerHost[w.key]; n < t.MaxConnsPerHost {
+		if t.connsPerHost == nil {
+			t.connsPerHost = make(map[connectMethodKey]int)
 		}
-		ch, ok := t.connPerHostAvailable[cmKey]
-		if !ok {
-			ch = make(chan struct{})
-			t.connPerHostAvailable[cmKey] = ch
-		}
-		return ch
+		t.connsPerHost[w.key] = n + 1
+		go t.dialConnFor(w)
+		return
 	}
-	if t.connPerHostCount == nil {
-		t.connPerHostCount = make(map[connectMethodKey]int)
+
+	if t.connsPerHostWait == nil {
+		t.connsPerHostWait = make(map[connectMethodKey]wantConnQueue)
 	}
-	t.connPerHostCount[cmKey]++
-	// return a closed channel to avoid race: if decHostConnCount is called
-	// after incHostConnCount and during the nil check, decHostConnCount
-	// will delete the channel since it's not being listened on yet.
-	return connsPerHostClosedCh
+	q := t.connsPerHostWait[w.key]
+	q.cleanFront()
+	q.pushBack(w)
+	t.connsPerHostWait[w.key] = q
 }
 
-// decHostConnCount decrements the count of connections
-// for a given host.
-// See Transport.MaxConnsPerHost.
-func (t *Transport) decHostConnCount(cmKey connectMethodKey) {
+// dialConnFor dials on behalf of w and delivers the result to w.
+// dialConnFor has received permission to dial w.cm and is counted in t.connCount[w.cm.key()].
+// If the dial is canceled or unsuccessful, dialConnFor decrements t.connCount[w.cm.key()].
+func (t *Transport) dialConnFor(w *wantConn) {
+
+	ctx := w.getCtxForDial()
+	if ctx == nil {
+		t.decConnsPerHost(w.key)
+		return
+	}
+
+	pc, err := t.dialConn(ctx, w.cm)
+	delivered := w.tryDeliver(pc, err)
+	if err == nil && !delivered {
+		t.putOrCloseIdleConn(pc)
+	}
+	if err != nil {
+		t.decConnsPerHost(w.key)
+	}
+}
+
+// decConnsPerHost decrements the per-host connection count for key,
+// which may in turn give a different waiting goroutine permission to dial.
+func (t *Transport) decConnsPerHost(key connectMethodKey) {
 	if t.MaxConnsPerHost <= 0 {
 		return
 	}
-	t.connCountMu.Lock()
-	defer t.connCountMu.Unlock()
-	t.connPerHostCount[cmKey]--
-	select {
-	case t.connPerHostAvailable[cmKey] <- struct{}{}:
-	default:
-		// close channel before deleting avoids getConn waiting forever in
-		// case getConn has reference to channel but hasn't started waiting.
-		// This could lead to more than MaxConnsPerHost in the unlikely case
-		// that > 1 go routine has fetched the channel but none started waiting.
-		if t.connPerHostAvailable[cmKey] != nil {
-			close(t.connPerHostAvailable[cmKey])
+
+	t.connsPerHostMu.Lock()
+	defer t.connsPerHostMu.Unlock()
+	n := t.connsPerHost[key]
+	if n == 0 {
+		// Shouldn't happen, but if it does, the counting is buggy and could
+		// easily lead to a silent deadlock, so report the problem loudly.
+		panic("internal error: connCount underflow")
+	}
+
+	// Can we hand this count to a goroutine still waiting to dial?
+	// (Some goroutines on the wait list may have timed out or
+	// gotten a connection another way. If they're all gone,
+	// we don't want to kick off any spurious dial operations.)
+	if q := t.connsPerHostWait[key]; q.len() > 0 {
+		done := false
+		for q.len() > 0 {
+			w := q.popFront()
+			if w.waiting() {
+				go t.dialConnFor(w)
+				done = true
+				break
+			}
 		}
-		delete(t.connPerHostAvailable, cmKey)
+		if q.len() == 0 {
+			delete(t.connsPerHostWait, key)
+		} else {
+			// q is a value (like a slice), so we have to store
+			// the updated q back into the map.
+			t.connsPerHostWait[key] = q
+		}
+		if done {
+			return
+		}
 	}
-	if t.connPerHostCount[cmKey] == 0 {
-		delete(t.connPerHostCount, cmKey)
-	}
-}
 
-// connCloseListener wraps a connection, the transport that dialed it
-// and the connected-to host key so the host connection count can be
-// transparently decremented by whatever closes the embedded connection.
-type connCloseListener struct {
-	net.Conn
-	t        *Transport
-	cmKey    connectMethodKey
-	didClose int32
-}
-
-func (c *connCloseListener) Close() error {
-	if atomic.AddInt32(&c.didClose, 1) != 1 {
-		return nil
+	// Otherwise, decrement the recorded count.
+	if n--; n == 0 {
+		delete(t.connsPerHost, key)
+	} else {
+		t.connsPerHost[key] = n
 	}
-	err := c.Conn.Close()
-	c.t.decHostConnCount(c.cmKey)
-	return err
 }
 
 // Add TLS to a persistent connection, i.e. negotiate a TLS session. If pconn is already a TLS
@@ -1185,10 +1268,6 @@ func (t *Transport) dialConn(ctx context.Context, cm *connectMethod) (*persistCo
 		if cm.proxyURL != nil {
 			// Return a typed error, per Issue 16997
 			return &net.OpError{Op: "proxyconnect", Net: "tcp", Err: err}
-		}
-		if _, ok := err.(*net.OpError); !ok {
-			// Return a typed error, per Issue 16997
-			return &net.OpError{Op: "dial", Net: cm.connInfo.Network, Err: err}
 		}
 		return err
 	}
@@ -1292,10 +1371,6 @@ func (t *Transport) dialConn(ctx context.Context, cm *connectMethod) (*persistCo
 		}
 	}
 
-	if t.MaxConnsPerHost > 0 {
-		pconn.conn = &connCloseListener{Conn: pconn.conn, t: t, cmKey: pconn.cacheKey}
-	}
-
 	if cm.isProxy {
 		pconn.proxyURL = cm.proxyURL
 	}
@@ -1303,8 +1378,8 @@ func (t *Transport) dialConn(ctx context.Context, cm *connectMethod) (*persistCo
 	pconn.connState.Conn = pconn.conn
 	pconn.conn = &mockConn{pconn.conn, &pconn.connState}
 
-	pconn.br = bufio.NewReader(pconn.conn)
-	pconn.bw = bufio.NewWriter(pconn.conn)
+	pconn.br = bufio.NewReaderSize(pconn.conn, t.readBufferSize())
+	pconn.bw = bufio.NewWriterSize(pconn.conn, t.writeBufferSize())
 
 	go pconn.readLoop()
 	go pconn.writeLoop()
@@ -1369,8 +1444,8 @@ type persistConn struct {
 	writech chan writeRequest   // written by roundTrip; read by writeLoop
 	closech chan struct{}       // closed when conn closed
 
-	sawEOF    bool  // whether we've seen EOF from conn; owned by readLoop
-	readLimit int64 // bytes allowed to be read; owned by readLoop
+	sawEOF bool // whether we've seen EOF from conn; owned by readLoop
+	// readLimit int64 // bytes allowed to be read; owned by readLoop
 	// writeErrCh passes the request write error (usually nil)
 	// from the writeLoop goroutine to the readLoop which passes
 	// it off to the res.Body reader, which then uses it to decide
@@ -1654,7 +1729,6 @@ func (pc *persistConn) gotIdleConnTrace(idleAt time.Time, t *TraceGotConnInfo) {
 	if !idleAt.IsZero() {
 		t.IdleTime = time.Since(idleAt)
 	}
-	return
 }
 
 func (pc *persistConn) cancelRequest(err error) {
@@ -1668,6 +1742,7 @@ func (pc *persistConn) cancelRequest(err error) {
 // This is what's called by the persistConn's idleTimer, and is run in its
 // own goroutine.
 func (pc *persistConn) closeConnIfStillIdle() {
+	// xlog.Warnf("close idle conn %v", pc.cacheKey.Addr)
 	t := pc.t
 	t.idleMu.Lock()
 	defer t.idleMu.Unlock()
@@ -1688,6 +1763,15 @@ func (pc *persistConn) mapRoundTripError(req *transportRequest, err error) error
 	if err == nil {
 		return nil
 	}
+
+	// Wait for the writeLoop goroutine to terminate to avoid data
+	// races on callers who mutate the request on failure.
+	//
+	// When resc in pc.roundTrip and hence rc.ch receives a responseAndError
+	// with a non-nil error it implies that the persistConn is either closed
+	// or closing. Waiting on pc.writeLoopDone is hence safe as all callers
+	// close closech which in turn ensures writeLoop returns.
+	<-pc.writeLoopDone
 
 	// If the request was canceled, that's better than network
 	// failures that were likely the result of tearing down the
@@ -1714,7 +1798,6 @@ func (pc *persistConn) mapRoundTripError(req *transportRequest, err error) error
 		return err
 	}
 	if pc.isBroken() {
-		<-pc.writeLoopDone
 		if e, ok := err.(*TransportWriteError); ok {
 			e.WriteBytes = pc.connState.WriteBytes
 			return e
@@ -2019,6 +2102,7 @@ func (pc *persistConn) closeLocked(err error) {
 	}
 	pc.broken = true
 	if pc.closed == nil {
+		pc.t.decConnsPerHost(pc.cacheKey)
 		pc.closed = err
 		pc.conn.Close()
 		close(pc.closech)
@@ -2091,7 +2175,6 @@ var (
 	errTlsHandshakeTimeout = errors.New("TLS handshake timeout")
 	errReadTimeout         = errors.New("read response timeout")
 	errWriteTimeout        = errors.New("write request timeout")
-	errCloseOnNoResponse   = errors.New("close conn on no response")
 )
 
 var ErrServerClosedConn = errors.New("server closed connection")
@@ -2257,4 +2340,143 @@ func ErrIsTimeout(e error) bool {
 		return e.Timeout()
 	}
 	return false
+}
+
+/****************************************/
+
+// A wantConn records state about a wanted connection
+// (that is, an active call to getConn).
+// The conn may be gotten by dialing or by finding an idle connection,
+// or a cancellation may make the conn no longer wanted.
+// These three options are racing against each other and use
+// wantConn to coordinate and agree about the winning outcome.
+type wantConn struct {
+	cm    *connectMethod
+	key   connectMethodKey // cm.key()
+	ctx   context.Context  // context for dial
+	ready chan struct{}    // closed when pc, err pair is delivered
+
+	mu  sync.Mutex // protects pc, err, close(ready)
+	pc  *persistConn
+	err error
+}
+
+// waiting reports whether w is still waiting for an answer (connection or error).
+func (w *wantConn) waiting() bool {
+	select {
+	case <-w.ready:
+		return false
+	default:
+		return true
+	}
+}
+
+// getCtxForDial returns context for dial or nil if connection was delivered or canceled.
+func (w *wantConn) getCtxForDial() context.Context {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ctx
+}
+
+// tryDeliver attempts to deliver pc, err to w and reports whether it succeeded.
+func (w *wantConn) tryDeliver(pc *persistConn, err error) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.pc != nil || w.err != nil {
+		return false
+	}
+
+	w.ctx = nil
+	w.pc = pc
+	w.err = err
+	if w.pc == nil && w.err == nil {
+		panic("internal error: misuse of tryDeliver")
+	}
+	close(w.ready)
+	return true
+}
+
+// cancel marks w as no longer wanting a result (for example, due to cancellation).
+// If a connection has been delivered already, cancel returns it with t.putOrCloseIdleConn.
+func (w *wantConn) cancel(t *Transport, err error) {
+	w.mu.Lock()
+	if w.pc == nil && w.err == nil {
+		close(w.ready) // catch misbehavior in future delivery
+	}
+	pc := w.pc
+	w.ctx = nil
+	w.pc = nil
+	w.err = err
+	w.mu.Unlock()
+
+	if pc != nil {
+		t.putOrCloseIdleConn(pc)
+	}
+}
+
+// A wantConnQueue is a queue of wantConns.
+type wantConnQueue struct {
+	// This is a queue, not a deque.
+	// It is split into two stages - head[headPos:] and tail.
+	// popFront is trivial (headPos++) on the first stage, and
+	// pushBack is trivial (append) on the second stage.
+	// If the first stage is empty, popFront can swap the
+	// first and second stages to remedy the situation.
+	//
+	// This two-stage split is analogous to the use of two lists
+	// in Okasaki's purely functional queue but without the
+	// overhead of reversing the list when swapping stages.
+	head    []*wantConn
+	headPos int
+	tail    []*wantConn
+}
+
+// len returns the number of items in the queue.
+func (q *wantConnQueue) len() int {
+	return len(q.head) - q.headPos + len(q.tail)
+}
+
+// pushBack adds w to the back of the queue.
+func (q *wantConnQueue) pushBack(w *wantConn) {
+	q.tail = append(q.tail, w)
+}
+
+// popFront removes and returns the wantConn at the front of the queue.
+func (q *wantConnQueue) popFront() *wantConn {
+	if q.headPos >= len(q.head) {
+		if len(q.tail) == 0 {
+			return nil
+		}
+		// Pick up tail as new head, clear tail.
+		q.head, q.headPos, q.tail = q.tail, 0, q.head[:0]
+	}
+	w := q.head[q.headPos]
+	q.head[q.headPos] = nil
+	q.headPos++
+	return w
+}
+
+// peekFront returns the wantConn at the front of the queue without removing it.
+func (q *wantConnQueue) peekFront() *wantConn {
+	if q.headPos < len(q.head) {
+		return q.head[q.headPos]
+	}
+	if len(q.tail) > 0 {
+		return q.tail[0]
+	}
+	return nil
+}
+
+// cleanFront pops any wantConns that are no longer waiting from the head of the
+// queue, reporting whether any were popped.
+func (q *wantConnQueue) cleanFront() (cleaned bool) {
+	for {
+		w := q.peekFront()
+		if w == nil || w.waiting() {
+			return cleaned
+		}
+		q.popFront()
+		cleaned = true
+	}
 }

@@ -1,15 +1,12 @@
 package xmq
 
-// #include <unistd.h>
-//
-import "C"
-
 import (
 	"net"
 	"sync/atomic"
 	"time"
 
 	"github.com/ccxp/xgo/xnet"
+	"golang.org/x/sys/unix"
 )
 
 func getUUID() (uint64, uint64) {
@@ -69,7 +66,7 @@ func getLocalIp() uint32 {
 
 func init() {
 	localip = getLocalIp()
-	pid = uint32(C.getpid())
+	pid = uint32(unix.Getpid())
 	uuidX = uint64(localip)<<32 | uint64(pid)
 	uuidY = uint64(time.Now().UnixNano())
 }

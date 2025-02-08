@@ -291,7 +291,13 @@ func (c *IniConfig) GetSection(section string) (map[string]string, error) {
 	if v, ok := c.data[strings.ToLower(section)]; ok {
 		return v, nil
 	}
-	return nil, errors.New("not exist section")
+	return nil, errNoSection
+}
+
+// HasSection用于判断是否有某个section
+func (c *IniConfig) HasSection(section string) bool {
+	_, ok := c.data[strings.ToLower(section)]
+	return ok
 }
 
 // section.key or key
@@ -334,6 +340,7 @@ func (c *IniConfig) GetValues() map[string]map[string]string {
 //
 // It accept value formats "${env}" , "${env||}}" , "${env||defaultValue}" , "defaultvalue".
 // Examples:
+//
 //	v1 := config.getEnvValue("${GOPATH}")			// return the GOPATH environment variable.
 //	v2 := config.getEnvValue("${GOAsta||/usr/local/go}")	// return the default value "/usr/local/go/".
 //	v3 := config.getEnvValue("Astaxie")				// return the value "Astaxie".
@@ -372,7 +379,10 @@ func getEnvValue(value string) (realValue string) {
 	return
 }
 
-var errValue = errors.New("value error")
+var (
+	errValue     = errors.New("value error")
+	errNoSection = errors.New("not exist section")
+)
 
 func ParseDuration(S string) (time.Duration, error) {
 

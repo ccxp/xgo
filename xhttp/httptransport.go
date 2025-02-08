@@ -114,6 +114,10 @@ func (r *httpRequest) Reset() error {
 			return err
 		}
 		r.req = &newReq
+
+		r.Body = newReq.Body
+		r.BodyCloser = newReq.Body
+		r.ContentLength = r.outgoingLength()
 	}
 	return nil
 }
@@ -248,8 +252,18 @@ type Transport struct {
 	// proxies during CONNECT requests.
 	ProxyConnectHeader http.Header
 
-	xTransport       xnet.Transport
-	xTransportInited bool
+	// WriteBufferSize specifies the size of the write buffer used
+	// when writing to the transport.
+	// If zero, a default (currently 4KB) is used.
+	WriteBufferSize int
+
+	// ReadBufferSize specifies the size of the read buffer used
+	// when reading from the transport.
+	// If zero, a default (currently 4KB) is used.
+	ReadBufferSize int
+
+	xTransport         xnet.Transport
+	xTransportInitOnce sync.Once
 }
 
 func (t *Transport) setRequest(xReq xnet.Request, connInfo *xnet.ConnInfo) xnet.Request {
@@ -353,7 +367,8 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 //
 // data can be obtain by GetTransportRequestUserData in balancer and tracer.
 func (t *Transport) RoundTripWithUserData(req *http.Request, data interface{}) (resp *http.Response, err error) {
-	t.initTransport()
+
+	t.xTransportInitOnce.Do(t.initTransport)
 
 	xReq := &httpRequest{
 		req:      req,
@@ -1353,15 +1368,11 @@ func (b *domainBalancer) GetEndpoint(ctx context.Context, req xnet.Request, addr
 func (t *Transport) initTransport() {
 
 	t.xTransport.DialTimeout = t.DialTimeout
-	t.xTransport.SetRequest = t.setRequest
-	t.xTransport.GotConn = t.gotConn
 	t.xTransport.WriteRequestTimeout = t.WriteRequestTimeout
 	t.xTransport.ReadResponseTimeout = t.ResponseHeaderTimeout
 
-	if t.xTransportInited {
-		return
-	}
-
+	t.xTransport.SetRequest = t.setRequest
+	t.xTransport.GotConn = t.gotConn
 	t.xTransport.Tracer = t.Tracer
 
 	t.xTransport.DialContext = t.DialContext
@@ -1377,6 +1388,8 @@ func (t *Transport) initTransport() {
 	t.xTransport.MaxConnsPerHost = t.MaxConnsPerHost
 	t.xTransport.IdleConnTimeout = t.IdleConnTimeout
 	t.xTransport.ProxyConnectHeader = t.ProxyConnectHeader
+	t.xTransport.WriteBufferSize = t.WriteBufferSize
+	t.xTransport.ReadBufferSize = t.ReadBufferSize
 
 	if t.Proxy != nil {
 		t.xTransport.Proxy = t.proxy
@@ -1387,11 +1400,10 @@ func (t *Transport) initTransport() {
 		t.xTransport.Balancer = DefaultClientBalancer
 	}
 
-	t.xTransportInited = true
 }
 
 func (t *Transport) GetTransport() *xnet.Transport {
-	t.initTransport()
+	t.xTransportInitOnce.Do(t.initTransport)
 	return &t.xTransport
 }
 

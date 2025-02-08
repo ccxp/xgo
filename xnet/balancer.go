@@ -17,6 +17,7 @@ import (
 
 // ConnInfo 包含连接参数，Network + Addr 是连接池的map key.
 type ConnInfo struct {
+	// 连接参数，其中Network用于dial，Scheme为https时做tls handshake.
 	Network, Scheme, Addr string
 
 	// Host is used for https to handle tls handshake.

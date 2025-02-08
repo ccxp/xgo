@@ -1,0 +1,12 @@
+
+syntax = "proto3";
+package queueitem;
+
+message QueueItem {
+
+    bytes Data = 1;
+
+    int64 Timestamp = 2;
+
+    uint32 DataLen = 3;
+}

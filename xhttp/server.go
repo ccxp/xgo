@@ -3,9 +3,9 @@ package xhttp
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"strconv"
-	"sync/atomic"
 
 	"github.com/ccxp/xgo/xlog"
 	"github.com/ccxp/xgo/xnet"
@@ -117,14 +117,14 @@ func (h *ResponseHelper) Body() ([]byte, error) {
 	if h.UseBodyClose {
 		defer h.Resp.Body.Close()
 	} else {
-		defer io.Copy(ioutil.Discard, h.Resp.Body)
+		defer io.Copy(io.Discard, h.Resp.Body)
 	}
 
 	if h.CheckStatusOK && h.Resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("Http Response status code is %v", h.Resp.StatusCode)
 	}
 
-	return ioutil.ReadAll(h.Resp.Body)
+	return io.ReadAll(h.Resp.Body)
 }
 
 // Read data from Response.Body and decode by unmarshaler.
@@ -141,6 +141,26 @@ func (h *ResponseHelper) Unmarshal(unmarshaler func([]byte, interface{}) error, 
 // Read data from Response.Body and decode by json.Unmarshal.
 func (h *ResponseHelper) UnmarshalJSON(v interface{}) error {
 	return h.Unmarshal(json.Unmarshal, v)
+}
+
+func (h *ResponseHelper) Error() error {
+	if h.Err != nil {
+		return h.Err
+	}
+
+	if h.CheckStatusOK && h.Resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Http Response status code is %v", h.Resp.StatusCode)
+	}
+
+	return nil
+}
+
+func (h *ResponseHelper) Close() {
+	if h.UseBodyClose {
+		h.Resp.Body.Close()
+	} else {
+		io.Copy(io.Discard, h.Resp.Body)
+	}
 }
 
 type writeCloseFlusher interface {
@@ -612,11 +632,9 @@ func (srv *Server) mockListener(l net.Listener) *mockListener {
 		b: srv.Balancer,
 		t: srv.Tracer,
 	}
-	if ll, ok := l.(*net.TCPListener); ok {
-		r.tcpl = ll
-	} else {
-		r.l = l
-	}
+
+	r.l = l
+
 	return r
 }
 
@@ -722,9 +740,6 @@ func (srv *Server) initServer() {
 	if srv.Balancer != nil || srv.Tracer != nil {
 		// srv.mockConnState = &mockConnState{srv.Balancer, srv.Tracer, srv, srv.ConnState}
 		// srv.ConnState = srv.mockConnState.ConnState
-
-		bc := &baseContext{f: srv.BaseContext}
-		srv.BaseContext = bc.mock
 
 		cc := &connContext{f: srv.ConnContext}
 		srv.ConnContext = cc.mock
@@ -937,53 +952,22 @@ func (c *mockConn) CloseWrite() error {
 }
 
 type mockListener struct {
-	l    net.Listener
-	tcpl *net.TCPListener
+	l net.Listener
 
 	b *ServerBalancer
 	t *ServerTracer
-
-	st *listenerState
-	mu sync.Mutex
 }
 
 func (l *mockListener) Accept() (c net.Conn, e error) {
-
-	var lst *listenerState
-	if l.st != nil {
-		lst = l.st
-	} else {
-		tmp, _ := listenerMap.LoadAndDelete(l.Addr().String())
-		if tmp != nil {
-			lst = tmp.(*listenerState)
-			l.mu.Lock()
-			l.st = lst
-			l.mu.Unlock()
-		}
-
-	}
-
-	if lst == nil {
-		lst = &listenerState{}
-	}
 
 	for {
 		if l.b != nil && l.b.AcceptPrepare != nil {
 			l.b.AcceptPrepare()
 		}
-		if l.tcpl != nil {
-			tc, e := l.tcpl.AcceptTCP()
-			if e != nil {
-				return nil, e
-			}
-			tc.SetKeepAlive(true)
-			tc.SetKeepAlivePeriod(3 * time.Minute)
-			c = tc
-		} else {
-			c, e = l.l.Accept()
-			if e != nil {
-				return nil, e
-			}
+
+		c, e = l.l.Accept()
+		if e != nil {
+			return nil, e
 		}
 
 		if l.b != nil && l.b.Accept != nil {
@@ -1006,7 +990,6 @@ func (l *mockListener) Accept() (c net.Conn, e error) {
 
 		// 生成一个新的ConnState，可在connContext中获取，写进req的ctx里面
 		state := &xnet.ConnState{Conn: c}
-		lst.lastState.Store(state)
 
 		mockConn := &mockConn{
 			Conn: c,
@@ -1021,64 +1004,20 @@ func (l *mockListener) Accept() (c net.Conn, e error) {
 }
 
 func (l *mockListener) Close() error {
-	if l.tcpl != nil {
-		return l.tcpl.Close()
-	}
+
 	return l.l.Close()
 }
 
 func (l *mockListener) Addr() net.Addr {
-	if l.tcpl != nil {
-		return l.tcpl.Addr()
-	}
+
 	return l.l.Addr()
 }
 
 // ----------------------------------------------------------------mockListener
 
-type listenerState struct {
-	lastState atomic.Value
-}
-
-func (lst *listenerState) Store(v *xnet.ConnState) {
-	lst.lastState.Store(v)
-}
-
-func (lst *listenerState) Get() *xnet.ConnState {
-	v := lst.lastState.Load()
-	if v == nil {
-		return nil
-	}
-	return v.(*xnet.ConnState)
-}
-
-type listenerStateKeySt struct{}
-
-var listenerStateKey listenerStateKeySt
-
 type connStateKeySt struct{}
 
 var connStateKey connStateKeySt
-
-// 全局记下listen的信息
-var listenerMap sync.Map
-
-type baseContext struct {
-	f func(l net.Listener) context.Context
-}
-
-func (c baseContext) mock(l net.Listener) context.Context {
-	listenerState := &listenerState{}
-	listenerMap.Store(l.Addr().String(), listenerState)
-
-	var ctx context.Context
-	if c.f != nil {
-		ctx = c.f(l)
-	} else {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, listenerStateKey, listenerState)
-}
 
 type connContext struct {
 	f func(ctx context.Context, c net.Conn) context.Context
@@ -1088,18 +1027,22 @@ func (cc connContext) mock(ctx context.Context, c net.Conn) context.Context {
 	if cc.f != nil {
 		ctx = cc.f(ctx, c)
 	}
-	var tmp = ctx.Value(listenerStateKey)
-	if tmp == nil {
-		return ctx
+
+	var info *xnet.ConnState
+	if mc, ok := c.(*mockConn); ok {
+		info = mc.info
+	} else if tlsc, ok := c.(*tls.Conn); ok {
+		if mc, ok := tlsc.NetConn().(*mockConn); ok {
+			info = mc.info
+		}
 	}
 
-	lst := tmp.(*listenerState).Get()
-
-	if lst == nil {
-		return ctx
+	if info == nil {
+		// 一般不会拿到，万一呢
+		info = &xnet.ConnState{Conn: c}
 	}
 
-	return context.WithValue(ctx, connStateKey, lst)
+	return context.WithValue(ctx, connStateKey, info)
 }
 
 // ----------------------------------------------------------------Server Balancer

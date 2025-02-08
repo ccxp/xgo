@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ccxp/xgo/xlog"
+	"github.com/ccxp/xgo/xutil/internal/queueitem"
 	"github.com/ccxp/xgo/xutil/xfile"
 	"github.com/ccxp/xgo/xutil/xfilemq"
 	"github.com/pierrec/lz4"
@@ -104,9 +105,22 @@ type retryData struct {
 	res chan bool
 }
 type httpRoundTriperSender struct {
+	Addr     string
 	ch       chan []byte
 	retrych  chan retryData
 	retryLog *xfilemq.FileMQ
+}
+
+func (sender *httpRoundTriperSender) save2retry(b []byte) {
+
+	item := queueitem.QueueItem{
+		Data:      b,
+		Timestamp: time.Now().UnixNano(),
+		DataLen:   uint32(len(b)),
+	}
+	b, _ = item.Marshal()
+
+	sender.retryLog.Save(b)
 }
 
 // 异步发raft消息的队列，在一个Node节点内部使用.
@@ -147,7 +161,7 @@ type DataSender struct {
 	TraceAddrNotOK     func(sect int, addr string, retry bool)
 	TraceAddrQueueFull func(sect int, addr string)
 
-	NoRetry              bool // 不重试，测试队列发送积压时也会丢弃
+	NoRetry              bool // 发送失败不重试，队列积压时也会丢弃
 	RetryBinLogPath      string
 	RetryTimeoutDuration time.Duration
 
@@ -226,7 +240,7 @@ func (h *DataSender) sendEnqueue(sect int, b []byte, addr string) {
 
 		if retry {
 			xlog.Warnf("addr %v is not ok, save to retrylog", addr)
-			sender.retryLog.Save(b)
+			sender.save2retry(b)
 		} else {
 			xlog.Errorf("addr %v is not ok, discard", addr)
 		}
@@ -243,7 +257,7 @@ func (h *DataSender) sendEnqueue(sect int, b []byte, addr string) {
 
 		if !h.NoRetry {
 			xlog.Warnf("addr %v sender queue full, save to retrylog", addr)
-			sender.retryLog.Save(b)
+			sender.save2retry(b)
 		} else {
 			xlog.Errorf("addr %v sender queue full, discard", addr)
 		}
@@ -269,7 +283,8 @@ func (h *DataSender) getSender(sect int, addr string) *httpRoundTriperSender {
 	}
 
 	res = &httpRoundTriperSender{
-		ch: make(chan []byte, h.SendPoolSize),
+		Addr: addr,
+		ch:   make(chan []byte, h.SendPoolSize),
 	}
 
 	if !h.NoRetry {
@@ -278,7 +293,7 @@ func (h *DataSender) getSender(sect int, addr string) *httpRoundTriperSender {
 			DataPath:            h.RetryBinLogPath,
 			FilePrefix:          fmt.Sprintf("%v_%v", strings.ReplaceAll(addr, ":", "_"), sect),
 			FileSplitDuration:   time.Minute,
-			FileReserveDuration: h.RetryTimeoutDuration,
+			FileReserveDuration: h.RetryTimeoutDuration + time.Minute,
 			LogStatDuration:     time.Second,
 
 			// 带缓存的写读io用
@@ -348,46 +363,80 @@ func (h *DataSender) loopSender(sect int, addr string, sender *httpRoundTriperSe
 	}
 
 	var lastSendTime, curr time.Time
+	var ok bool
 	for {
 		select {
 		case body = <-sender.ch:
 			lastSendTime = time.Now()
-			c, e = h.send(compressType, sect, addr, body, header, c, dataMsg)
-			if e != nil {
-				xlog.Errorf("send to %v %v fail: %v", sect, addr, e)
-				if h.TraceSendFail != nil {
-					h.TraceSendFail(sect, addr, e)
+
+			// xlog.Warnf("[%v] send %v", sect, len(body))
+			if ok, retry := h.IsAddrOK(addr); !ok {
+
+				retry = retry && !h.NoRetry
+
+				if h.TraceAddrNotOK != nil {
+					h.TraceAddrNotOK(sect, addr, retry)
 				}
-				if !h.NoRetry {
-					sender.retryLog.Save(body)
+
+				if retry {
+					xlog.Warnf("addr %v is not ok, save to retrylog", addr)
+					sender.save2retry(body)
+				} else {
+					xlog.Errorf("addr %v is not ok, discard", addr)
 				}
+
 				h.sleep(time.Millisecond * 50)
-			}
-		case rd = <-sender.retrych:
-			lastSendTime = time.Now()
-			c, e = h.send(compressType, sect, addr, rd.b, header, c, dataMsg)
-			if e != nil {
-				rd.res <- false
 
-				xlog.Errorf("retry send to %v %v fail: %v", sect, addr, e)
-				if h.TraceSendFail != nil {
-					h.TraceSendFail(sect, addr, e)
+			} else {
+				c, e = h.send(compressType, sect, addr, body, header, c, dataMsg)
+				if e != nil {
+					xlog.Errorf("send to %v %v fail: %v", sect, addr, e)
+					if h.TraceSendFail != nil {
+						h.TraceSendFail(sect, addr, e)
+					}
+					if !h.NoRetry {
+						sender.save2retry(body)
+					}
+					h.sleep(time.Millisecond * 50)
 				}
+			}
 
+		case rd = <-sender.retrych:
+			if ok, _ := h.IsAddrOK(addr); !ok {
+				rd.res <- false
 				h.sleep(time.Millisecond * 50)
 			} else {
-				rd.res <- true
+				lastSendTime = time.Now()
+
+				// xlog.Warnf("[%v] retry send %v", sect, body)
+
+				c, e = h.send(compressType, sect, addr, rd.b, header, c, dataMsg)
+				if e != nil {
+					rd.res <- false
+
+					xlog.Errorf("retry send to %v %v fail: %v", sect, addr, e)
+					if h.TraceSendFail != nil {
+						h.TraceSendFail(sect, addr, e)
+					}
+
+					h.sleep(time.Millisecond * 50)
+				} else {
+					rd.res <- true
+				}
 			}
 
 		case <-heartbeatTicker.C:
-			curr = time.Now()
-			if int64(curr.Sub(lastSendTime)) > int64(h.HeartbeatDuration)/2 {
-				lastSendTime = curr
-				c, e = h.send(CompressNone, sect, addr, nil, header, c, heartbeatMsg)
-				if e != nil {
-					xlog.Errorf("send heartbeat to %v %v fail: %v", sect, addr, e)
-					if h.TraceSendFail != nil {
-						h.TraceSendFail(sect, addr, e)
+			ok, _ = h.IsAddrOK(addr)
+			if ok {
+				curr = time.Now()
+				if int64(curr.Sub(lastSendTime)) > int64(h.HeartbeatDuration)/2 {
+					lastSendTime = curr
+					c, e = h.send(CompressNone, sect, addr, nil, header, c, heartbeatMsg)
+					if e != nil {
+						xlog.Errorf("send heartbeat to %v %v fail: %v", sect, addr, e)
+						if h.TraceSendFail != nil {
+							h.TraceSendFail(sect, addr, e)
+						}
 					}
 				}
 			}
@@ -418,11 +467,15 @@ func (h *DataSender) loopRetry(sender *httpRoundTriperSender) {
 
 	var b []byte
 	res := make(chan bool)
-	var ok bool
+	var ok, retry bool
+
+	var item queueitem.QueueItem
+	var e error
+
 	for !h.closed {
 		b = sender.retryLog.Next()
 		if b == nil {
-			h.sleep(time.Second * 2)
+			h.sleep(time.Millisecond * 100)
 			continue
 		}
 
@@ -431,12 +484,45 @@ func (h *DataSender) loopRetry(sender *httpRoundTriperSender) {
 			continue
 		}
 
+		item = queueitem.QueueItem{}
+		e = item.Unmarshal(b)
+		if e == nil && item.DataLen == uint32(len(item.Data)) {
+			b = item.Data
+
+			if len(b) == 0 {
+				sender.retryLog.MarkSucc()
+				continue
+			}
+
+			// xlog.Errorf("read retry item %v to %v", item.Timestamp, sender.Addr)
+
+			if h.RetryTimeoutDuration > 0 && item.Timestamp > 0 &&
+				item.Timestamp < time.Now().UnixNano()-int64(h.RetryTimeoutDuration) {
+				sender.retryLog.MarkSucc()
+				xlog.Errorf("retry item expire %v, size %v, to %v", item.Timestamp, len(b), sender.Addr)
+				continue
+			}
+		}
+
+		ok, retry = h.IsAddrOK(sender.Addr)
+		if !ok {
+			if retry {
+				xlog.Warnf("addr %v is not ok, retry later", sender.Addr)
+				h.sleep(time.Millisecond * 100)
+			} else {
+				xlog.Errorf("addr %v is not ok, discard", sender.Addr)
+				sender.retryLog.MarkSucc()
+			}
+
+			continue
+		}
+
 		sender.retrych <- retryData{b, res}
 		ok = <-res
 		if ok {
 			sender.retryLog.MarkSucc()
 		} else {
-			h.sleep(time.Second * 2)
+			h.sleep(time.Millisecond * 100)
 		}
 
 	}
@@ -841,6 +927,11 @@ func (h *DataSender) ServReader(w http.ResponseWriter, req *http.Request) {
 			continue
 		}
 
+		if header[offsetMsgType] != dataMsg {
+			e = fmt.Errorf("msg type %v error", header[offsetMsgType])
+			return
+		}
+
 		switch int(header[offsetCompressType]) {
 		case CompressNone:
 			b = b1[0:l]
@@ -865,9 +956,11 @@ func (h *DataSender) ServReader(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
+		// xlog.Warnf("[%v] Step %v", sect, len(b))
+
 		e = h.Step(sect, b)
 		if e != nil {
-			xlog.Errorf("Step error %v", e)
+			e = fmt.Errorf("step error: %v, size %v", e, len(b))
 			if h.TraceStepFail != nil {
 				h.TraceStepFail(sect, from, e)
 			}

@@ -290,7 +290,7 @@ func (q *mqQueue) checkFile() (e error) {
 
 	// 生成队列文件writer
 	fn := fmt.Sprintf("%s/%s_%v.q%s", q.DataPath, q.FilePrefix, t, q.fileSuffix)
-	f, e := os.OpenFile(fn, os.O_WRONLY|os.O_CREATE, 0740)
+	f, e := os.OpenFile(fn, os.O_WRONLY|os.O_CREATE, 0640)
 	if e != nil {
 		xlog.Errorf("os.OpenFile fail: %v", e)
 		return
@@ -324,7 +324,7 @@ func (q *mqQueue) checkResultFile() (e error) {
 
 	// 生成队列文件writer
 	fn := fmt.Sprintf("%s/%s_%v.r%s", q.DataPath, q.FilePrefix, t, q.fileSuffix)
-	f, e := os.OpenFile(fn, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0740)
+	f, e := os.OpenFile(fn, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
 	if e != nil {
 		xlog.Errorf("os.OpenFile fail: %v", e)
 		return
@@ -651,6 +651,13 @@ func (q *mqQueue) status() (cnt, memSize, memLeft int) {
 	return
 }
 
+type (
+	HandleFunc        func(item *QueueItem) HANDLE_RESULT
+	HandleFuncV2      func(workerIdx int, isRetry bool, item *QueueItem) HANDLE_RESULT
+	BatchHandleFunc   func(items []*QueueItem, res []HANDLE_RESULT)
+	BatchHandleFuncV2 func(workerIdx int, isRetry bool, items []*QueueItem, res []HANDLE_RESULT)
+)
+
 type MQ struct {
 	QueueSize      int // 队列占用内存大小
 	RetryQueueSize int // 重试队列占用内存大小，为0则不重试
@@ -681,16 +688,14 @@ type MQ struct {
 	RetryWorkerCount int
 	RetryDelay       time.Duration // 重试延迟多久
 
-	// 数据处理函数，当Handler=nil时使用无handler模式
-	Handler   func(item *QueueItem) HANDLE_RESULT
-	HandlerV2 func(workerIdx int, isRetry bool, item *QueueItem) HANDLE_RESULT
+	// 以下4个为数据处理函数，只会使用其中一个，优先级为：
+	// BatchHandlerV2 > BatchHandler > HandlerV2 > Handler
+	// 无设置处理函数时为无handler模式，用户自己Pop数据进行处理.
+	Handler        HandleFunc
+	HandlerV2      HandleFuncV2
+	BatchHandler   BatchHandleFunc
+	BatchHandlerV2 BatchHandleFuncV2
 
-	// 批量处理模式，优先于Handler.
-	//
-	// 	res []HANDLE_RESULT: 已经按items大小设置好，用户需要设置 res[i] = RESULT_OK 就可以了
-	//
-	BatchHandler   func(items []*QueueItem, res []HANDLE_RESULT)
-	BatchHandlerV2 func(workerIdx int, isRetry bool, items []*QueueItem, res []HANDLE_RESULT)
 	// batch最大item数量，默认是10
 	BatchMaxItem int
 	// batch最大一次处理的包大小，默认是0
@@ -1190,11 +1195,10 @@ func (q *MQ) Close() {
 //
 // Err有可能是：
 //
-//	1. *ErrDelay：当取retry队列，而且retry有延迟时会返回*ErrDelay, 这时worker应该延迟一会再取.
-//	2. ErrEmptyQueue，队列是空
-// 	3. ErrQueueClosed
-//	4. 其它
-//
+//  1. *ErrDelay：当取retry队列，而且retry有延迟时会返回*ErrDelay, 这时worker应该延迟一会再取.
+//  2. ErrEmptyQueue，队列是空
+//  3. ErrQueueClosed
+//  4. 其它
 func (q *MQ) Pop(isRetryQueue bool) (item *QueueItem, e error) {
 
 	if q.closed {
@@ -1267,9 +1271,8 @@ func (q *MQ) SetResult(isRetryQueue bool, item *QueueItem, ret HANDLE_RESULT, ct
 //
 // Err有可能是：
 //
-//	1. ErrQueueClosed
-//	2. ErrContextCanceled
-//
+//  1. ErrQueueClosed
+//  2. ErrContextCanceled
 func (q *MQ) PopWait(isRetryQueue bool, ctx context.Context) (item *QueueItem, e error) {
 
 	for !q.closed {

@@ -171,7 +171,7 @@ func (q *FileMQ) checkWriter() (e error) {
 
 	// 生成队列文件writer
 	fn := fmt.Sprintf("%s/%s.%v", q.DataPath, q.FilePrefix, t)
-	f, e := os.OpenFile(fn, os.O_WRONLY|os.O_CREATE, 0740)
+	f, e := os.OpenFile(fn, os.O_WRONLY|os.O_CREATE, 0640)
 	if e != nil {
 		xlog.Errorf("os.OpenFile fail: %v", e)
 		return
