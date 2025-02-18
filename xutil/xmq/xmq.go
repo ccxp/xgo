@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"runtime"
 	"strconv"
@@ -878,7 +877,7 @@ func (q *MQ) autoClean() {
 }
 
 func (q *MQ) doCleanAll() {
-	files, _ := ioutil.ReadDir(q.DataPath)
+	files, _ := os.ReadDir(q.DataPath)
 
 	var name string
 	prefix := q.FilePrefix + "_"
@@ -952,64 +951,39 @@ func (q *MQ) Push(item *QueueItem) error {
 
 func (q *MQ) pop(isRetry, isWorker bool, ctx context.Context) (item *QueueItem, e error) {
 
-	if !isRetry {
-		item, e = q.queue.pop()
-		if item != nil {
-			return
-		}
-
-		if e != nil {
-			if isWorker {
-				if e1, ok := e.(*ErrDelay); ok {
-					time.Sleep(e1.Duration)
-					return nil, nil
-				} else {
-					return
-				}
-			} else {
-				return
-			}
-		}
-
-		select {
-		case <-q.queue.itemReadyCh:
-		case <-q.closeCh:
-			return nil, ErrQueueClosed
-		case <-ctx.Done():
-			return nil, ErrContextCanceled
-		}
-
-		return q.queue.pop()
-
-	} else {
-		item, e = q.retryQueue.pop()
-		if item != nil {
-			return
-		}
-
-		if e != nil {
-			if isWorker {
-				if e1, ok := e.(*ErrDelay); ok {
-					time.Sleep(e1.Duration)
-					return nil, nil
-				} else {
-					return
-				}
-			} else {
-				return
-			}
-		}
-
-		select {
-		case <-q.retryQueue.itemReadyCh:
-		case <-q.closeCh:
-			return nil, ErrQueueClosed
-		case <-ctx.Done():
-			return nil, ErrContextCanceled
-		}
-
-		return q.retryQueue.pop()
+	queue := q.queue
+	if isRetry {
+		queue = q.retryQueue
 	}
+
+	for {
+		item, e = queue.pop()
+		if item != nil {
+			return
+		}
+
+		if e != nil {
+			if isWorker {
+				if e1, ok := e.(*ErrDelay); ok {
+					time.Sleep(e1.Duration)
+					return nil, nil
+				} else {
+					return
+				}
+			} else {
+				return
+			}
+		}
+
+		select {
+		case <-queue.itemReadyCh:
+		case <-q.closeCh:
+			return nil, ErrQueueClosed
+		case <-ctx.Done():
+			return nil, ErrContextCanceled
+		}
+	}
+
 }
 
 func (q *MQ) handleItemResult(isRetry bool, item *QueueItem, ret HANDLE_RESULT, ctx context.Context) {
@@ -1123,7 +1097,7 @@ func (q *MQ) batchWork(id int, isRetry bool) {
 						break
 					}
 				}
-			} else if len(items) > 0 {
+			} else {
 				break
 			}
 		}
@@ -1134,7 +1108,7 @@ func (q *MQ) batchWork(id int, isRetry bool) {
 		}
 
 		q.batchHandle(id, isRetry, items, rets)
-		for i, _ := range items {
+		for i := range items {
 			q.handleItemResult(isRetry, items[i], rets[i], ctx)
 		}
 	}
